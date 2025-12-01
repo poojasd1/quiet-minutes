@@ -1,10 +1,7 @@
 
-import { GoogleGenAI, Type, Schema } from "@google/genai";
+import { Type, Schema } from "@google/genai";
 import { UserProfile, EnergyLevel, Activity, ActivityCategory } from "../types";
-
-// Ensure API key is present
-const apiKey = process.env.API_KEY || '';
-const ai = new GoogleGenAI({ apiKey });
+import { Agent } from "./adk";
 
 // --- MOCK DATA FOR FALLBACK/DEMO MODE ---
 const MOCK_ACTIVITIES: Activity[] = [
@@ -62,7 +59,9 @@ const MOCK_ACTIVITIES: Activity[] = [
   }
 ];
 
-// Schema for the Architect Agent (Output Formatter)
+// --- AGENT DEFINITIONS ---
+
+// 1. Schema for the Architect Agent
 const activitySchema: Schema = {
   type: Type.OBJECT,
   properties: {
@@ -104,17 +103,49 @@ const activitySchema: Schema = {
   }
 };
 
+// 2. Initialize Agents using ADK
+const researcherAgent = new Agent({
+  name: "Researcher (Tools)",
+  model: "gemini-2.5-flash",
+  tools: [{ googleSearch: {} }],
+  systemInstruction: "You are a helpful researcher. For physical tasks, use search to verify. For mental tasks, be creative and generate the content yourself."
+});
+
+const researcherFallbackAgent = new Agent({
+  name: "Researcher (LLM Only)",
+  model: "gemini-2.5-flash",
+  systemInstruction: "You are a creative wellbeing expert. Generate specific, actionable activities based on the persona."
+});
+
+const architectAgent = new Agent({
+  name: "Architect",
+  model: "gemini-2.5-flash",
+  responseMimeType: "application/json",
+  responseSchema: activitySchema,
+  systemInstruction: "You are a strict data formatter. Convert loose research text into the specified JSON schema."
+});
+
+const coachAgent = new Agent({
+  name: "Coach",
+  model: "gemini-2.5-flash",
+  systemInstruction: "You are a warm, encouraging personal coach. Keep responses under 20 words."
+});
+
+
+// --- ORCHESTRATION LOGIC ---
+
 export const generateActivities = async (
   profile: UserProfile,
   minutesAvailable: number,
   energy: EnergyLevel
 ): Promise<Activity[]> => {
-  if (!apiKey) {
+  // Check for API Key availability via a dummy check on an agent
+  if (!process.env.API_KEY) {
     console.warn("API Key missing - Serving Mock Data");
-    return new Promise(resolve => setTimeout(() => resolve(MOCK_ACTIVITIES), 1500));
+    return getMockData(minutesAvailable);
   }
 
-  // Summarize recent history for Context Compaction
+  // Context Compaction
   const recentHistory = profile.history.slice(-5).map(h => 
     `- Did "${h.activityTitle}" on ${new Date(h.timestamp).toLocaleDateString()} (Feedback: ${h.feedback?.enjoyment}, ${h.feedback?.difficulty})`
   ).join('\n');
@@ -123,10 +154,8 @@ export const generateActivities = async (
     ? "IMPORTANT: Output EVERYTHING in Hindi (Devanagari script), including titles, descriptions, steps, and quiz content." 
     : "Output in English.";
 
-  // --- AGENT 1: RESEARCHER (Context & Discovery) ---
+  // Agent 1 Prompt
   const researcherPrompt = `
-    You are the "Content Planner Agent" in a multi-agent concierge system.
-    
     **User Profile**: "${profile.persona}" named ${profile.name}.
     **Goals**: ${profile.goals.join(", ")}.
     **Current Context**: ${minutesAvailable} minutes available, Energy Level: "${energy}".
@@ -150,41 +179,27 @@ export const generateActivities = async (
   let researchOutput = "";
   let searchGroundingChunks: any[] = [];
 
-  // Attempt 1: Researcher WITH Google Search Tools
+  // Step 1: Run Researcher
   try {
-    const researchResponse = await ai.models.generateContent({
-      model: 'gemini-2.5-flash',
-      contents: researcherPrompt,
-      config: {
-        tools: [{ googleSearch: {} }],
-        systemInstruction: "You are a helpful researcher. For physical tasks, use search to verify. For mental tasks, be creative and generate the content yourself.",
-      }
-    });
+    const response = await researcherAgent.run(researcherPrompt);
+    if (!response) throw new Error("Researcher failed");
     
-    researchOutput = researchResponse.text || "";
-    searchGroundingChunks = researchResponse.candidates?.[0]?.groundingMetadata?.groundingChunks || [];
+    researchOutput = Agent.getText(response);
+    searchGroundingChunks = Agent.getGroundingChunks(response);
     
   } catch (error) {
-    console.warn("Researcher Agent (With Tools) failed. Falling back to internal knowledge.", error);
-    
-    // Attempt 2: Researcher WITHOUT Tools (Graceful Fallback)
-    // This handles cases where the Search Tool might be unavailable or restricted.
+    console.warn("Researcher (Tools) failed. Attempting fallback agent.", error);
     try {
-        const fallbackResponse = await ai.models.generateContent({
-            model: 'gemini-2.5-flash',
-            contents: researcherPrompt,
-        });
-        researchOutput = fallbackResponse.text || "";
+        const fallbackResponse = await researcherFallbackAgent.run(researcherPrompt);
+        researchOutput = Agent.getText(fallbackResponse);
     } catch (fallbackError) {
-        console.error("Researcher Agent (Fallback) failed. Using generic prompt.", fallbackError);
-        researchOutput = "Generate 3 generic activities (Brain, Body, Reflection) suitable for the user's context.";
+        console.error("All Research Agents failed. Serving Mock Data.");
+        return getMockData(minutesAvailable);
     }
   }
 
-  // --- AGENT 2: ARCHITECT (Structured Output) ---
+  // Step 2: Run Architect
   const architectPrompt = `
-    You are the "Architect Agent". Format the raw research into strict JSON.
-
     **Raw Research**:
     ${researchOutput}
 
@@ -196,30 +211,22 @@ export const generateActivities = async (
     5. Otherwise, leave 'interactive' null.
     6. 'durationMinutes' should be approx ${minutesAvailable}.
     7. 'rationale' must explain fit for ${profile.name} (${energy}).
-    8. ${languageInstruction} Ensure the JSON values (titles, descriptions, etc.) are in the correct language. Keys must remain in English.
+    8. ${languageInstruction} Ensure the JSON values are in the correct language. Keys in English.
     9. For 'category', use exactly one of these strings: ${Object.values(ActivityCategory).map(v => `"${v}"`).join(', ')}.
   `;
 
   try {
-    const architectResponse = await ai.models.generateContent({
-      model: 'gemini-2.5-flash',
-      contents: architectPrompt,
-      config: {
-        responseMimeType: "application/json",
-        responseSchema: activitySchema,
-      }
-    });
-
-    const text = architectResponse.text;
+    const architectResponse = await architectAgent.run(architectPrompt);
+    const text = Agent.getText(architectResponse);
+    
     if (!text) throw new Error("Empty response from Architect");
     
     const data = JSON.parse(text);
     const activities: Activity[] = data.activities || [];
 
-    // Augment with grounding data if available
+    // Augment with grounding data
     if (searchGroundingChunks.length > 0) {
       activities.forEach((act, idx) => {
-        // Only add source URL if not interactive (interactive content is self-contained)
         if (!act.sourceUrl && !act.interactive && searchGroundingChunks[idx]?.web?.uri) {
            act.sourceUrl = searchGroundingChunks[idx].web.uri;
         }
@@ -227,12 +234,11 @@ export const generateActivities = async (
     }
 
     if (activities.length === 0) throw new Error("No activities parsed");
-
     return activities;
 
   } catch (error) {
     console.error("Architect Agent failed, serving MOCK data:", error);
-    return MOCK_ACTIVITIES;
+    return getMockData(minutesAvailable);
   }
 };
 
@@ -240,7 +246,7 @@ export const generateEncouragement = async (
   profile: UserProfile,
   activity: Activity
 ): Promise<string> => {
-   if (!apiKey) return "Great job! Keep it up.";
+   if (!process.env.API_KEY) return "Great job! Keep it up.";
 
    const languageInstruction = profile.language === 'hi' 
     ? "Output in Hindi (Devanagari script)." 
@@ -252,13 +258,18 @@ export const generateEncouragement = async (
      ${languageInstruction}
    `;
    
-   try {
-    const response = await ai.models.generateContent({
-      model: 'gemini-2.5-flash',
-      contents: prompt,
-    });
-    return response.text || "Well done!";
-   } catch (e) {
-     return "Well done!";
-   }
+   const response = await coachAgent.run(prompt);
+   return Agent.getText(response) || "Well done!";
 }
+
+// Helper for Mock Data
+const getMockData = async (minutes: number): Promise<Activity[]> => {
+    return new Promise(resolve => setTimeout(() => {
+        // Deep copy and adjust minutes
+        const adjustedMock = MOCK_ACTIVITIES.map(a => ({
+            ...a,
+            durationMinutes: minutes
+        }));
+        resolve(adjustedMock);
+    }, 1500));
+};
